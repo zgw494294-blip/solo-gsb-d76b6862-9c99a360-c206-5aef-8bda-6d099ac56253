@@ -27,8 +27,15 @@ label），初始**无人持有**。
   先后次序，不会出现结稿成功后仍写入修改或领取的情况。
 
 `CopyState` 为不依赖数据库的纯内存核心（便于单测）；`CopyStore` 用 SQLite
-持久化，每个变更操作在进程级锁内「完整读入 → 纯核心运算 → 整体写回」，
-因此并发请求等价于逐次完整执行，不会丢失其他批注的修改。旧库启动时自动
+持久化，每个变更操作在进程级锁内「完整读入 → 纯核心运算 → 整体写回 →
+取定响应快照」，因此并发请求等价于逐次完整执行，不会丢失其他批注的修改。
+**成功响应在锁内、事务提交后立即从本次运算的同一内存状态上取定**（不再
+解锁后重读），所以领取 / 释放 / 修改 / 结稿响应中的 `revision`、`status`、
+`annotations`、`groups` 严格对应**本次提交**的完整快照——即使响应真正
+返回前已有后续请求串行提交了更新的版本，响应也不会混入后续版本的结果
+（例如领取提交 revision=2、响应返回前同一审阅者又释放提交 revision=3
+时，领取响应仍为 revision=2 且整组由本人持有）；本人重复领取（幂等）返回
+**判定时**的快照，不增加版本或历史。旧库启动时自动
 补 `status` 列，旧副本默认 `open` 且原 `revision` 不变。
 
 **版本历史（回看）**：创建时记录 `revision=1` 的完整快照；此后每次使
@@ -624,13 +631,29 @@ class CopyStore:
             finally:
                 conn.close()
 
+    def _after_commit(self, copy_id: str, op: str, changed: bool,
+                      snapshot: dict) -> None:
+        """提交后、返回前的可注入交错点（默认无操作，仅供回归测试覆写）。
+
+        调用时仍持有进程锁（``RLock`` 可重入），测试可在此同步发起**另一整
+        次**变更，用来确定性复现「本操作已提交、响应尚未返回」窗口里的后续
+        请求。响应快照已在调用前从本次运算的内存状态上取定，因此覆写此方法
+        插入的后续提交不会影响本操作返回的快照内容。
+        """
+
     def _apply(self, copy_id: str, operation, op: str,
                reviewer: str | None) -> dict:
-        """在锁内完整执行「读入 → 运算 → 整体写回」，失败不写任何内容。
+        """在锁内完整执行「读入 → 运算 → 整体写回 → 取定响应快照」，失败不写任何内容。
 
         成功变更把新版本的完整历史快照（含操作类型 op 与 reviewer）与副本
         变更在同一事务提交——任一步写入失败二者均不变；幂等领取（运算返回
         False）与失败请求都不产生版本记录。
+
+        成功响应（含幂等领取）**在锁内、事务提交之后立即从本次运算的同一
+        内存状态取定完整快照**并作为返回值，不再解锁后重读数据库：因此响应
+        的 revision、status、annotations、groups 严格对应**本次提交**，即使
+        响应真正返回前已有其他请求串行提交了更新的版本，也不会把后续版本的
+        结果混入本次响应。
         """
         with self._lock:
             conn = self._connect()
@@ -655,12 +678,19 @@ class CopyStore:
                     # 本次提交的状态，不会混入后续版本。
                     self._record_revision(conn, state, op, reviewer)
                     conn.commit()
+                # 响应快照必须在锁内、且先于任何后续提交从本次运算状态上取
+                # 定（state 不与其他请求共享，后续操作会各自重新读入新状态），
+                # 从而 revision/status/annotations/groups 精确对应本次提交——
+                # 不会出现领取提交 revision=2 后、响应重读却拿到后续 revision=3
+                # 的情况；幂等领取返回判定时的快照，不增版本或历史。
+                snapshot = state.snapshot()
+                self._after_commit(copy_id, op, changed is not False, snapshot)
+                return snapshot
             except BaseException:
                 conn.rollback()
                 raise
             finally:
                 conn.close()
-        return self.get(copy_id)
 
     def claim(self, copy_id: str, ann_id: str, reviewer: str) -> dict:
         return self._apply(copy_id, lambda st: st.claim(ann_id, reviewer),
