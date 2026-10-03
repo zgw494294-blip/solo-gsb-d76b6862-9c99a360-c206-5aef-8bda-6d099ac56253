@@ -206,6 +206,12 @@
   - 新组**触及其他持有者**的批注 → 返回 **409**，**范围与持有权均不变**；
   - 原组被**拆开**时，各碎片**保留原持有者**；
   - 仅相接（不连边）不视为触及，不冲突。
+- **响应版本语义**：领取 / 释放 / 修改（与结稿）的成功响应是**本次提交**的
+  完整快照——`revision`、`status`、`annotations`、`groups` 在锁内由刚提交的
+  状态生成，**不会混入**提交完成后才到达的后续请求的结果（例如领取提交
+  rev2 后、响应返回前同一审阅者又释放提交 rev3，领取响应仍是 rev2：本人
+  持有整组，而非 rev3 的无人持有）；**本人重复领取（幂等）返回判定时的
+  快照**，不增加版本或历史。
 - **失败原子性**：非法输入（非字符串 `id`、空 `label`、`0 ≤ start < end ≤ 文本长度`
   不满足、重复 `id`、空 `reviewer` 等）返回 **422**；任何失败（422 / 409 / 404）
   **都不改变副本**。注意**空字符串 `id` 是合法的唯一字符串**（不是非法输入），
@@ -268,9 +274,9 @@ SQLite 数据库在容器内位于 `/data/copies.db`（`docker-compose.yml` 的�
 | --- | --- | --- |
 | POST | `/api/copies` | 入参 `{text, annotations:[{id,start,end,label}]}`（`id` 为唯一字符串），创建副本，返回 **201** 与初始快照（无人持有，`status=open`，`revision=1`）；非法输入 **422** |
 | GET | `/api/copies/{id}` | 返回 `{id, text, revision, status, annotations:[{id,start,end,label,holder}], groups:[{annotation_ids,holder}]}`；未知副本 **404** |
-| POST | `/api/copies/{id}/annotations/{ann_id}/claim` | 入参 `{reviewer}`，按批注 id **整组领取**，返回最新快照；他人持有 **409**，`reviewer` 非法 **422**，批注 / 副本不存在 **404**，已结稿 **409**。`ann_id` 为任意唯一字符串，路径段须**百分号编码**（`审阅/1` → `%E5%AE%A1%E9%98%85%2F1`，`a\n` → `a%0A`，空串 → 相邻两个斜杠，见上文） |
-| POST | `/api/copies/{id}/annotations/{ann_id}/release` | 入参 `{reviewer}`，**持有者整组释放**；无人持有 / 他人持有 / 已结稿 **409**，`reviewer` 非法 **422**；`ann_id` 编码规则同 claim |
-| PATCH | `/api/copies/{id}/annotations/{ann_id}` | 入参 `{reviewer, start, end, label}`，仅持有者改单条范围与 label，随后重算分组；触及他人 **409**（范围与持有权均不变），未持有 / 已结稿 **409**，非法区间 / 空 label **422**。空串 id 的 URL 为 `.../annotations/`（以斜杠结尾）；`/`、字面 `%2F`、换行 `\n` 分别写作 `%2F`、`%252F`、`%0A` |
+| POST | `/api/copies/{id}/annotations/{ann_id}/claim` | 入参 `{reviewer}`，按批注 id **整组领取**，返回**本次提交的完整快照**（本人重复领取幂等，返回判定时的快照，不增版本）；他人持有 **409**，`reviewer` 非法 **422**，批注 / 副本不存在 **404**，已结稿 **409**。`ann_id` 为任意唯一字符串，路径段须**百分号编码**（`审阅/1` → `%E5%AE%A1%E9%98%85%2F1`，`a\n` → `a%0A`，空串 → 相邻两个斜杠，见上文） |
+| POST | `/api/copies/{id}/annotations/{ann_id}/release` | 入参 `{reviewer}`，**持有者整组释放**，返回**本次提交的完整快照**；无人持有 / 他人持有 / 已结稿 **409**，`reviewer` 非法 **422**；`ann_id` 编码规则同 claim |
+| PATCH | `/api/copies/{id}/annotations/{ann_id}` | 入参 `{reviewer, start, end, label}`，仅持有者改单条范围与 label，随后重算分组，返回**本次提交的完整快照**；触及他人 **409**（范围与持有权均不变），未持有 / 已结稿 **409**，非法区间 / 空 label **422**。空串 id 的 URL 为 `.../annotations/`（以斜杠结尾）；`/`、字面 `%2F`、换行 `\n` 分别写作 `%2F`、`%252F`、`%0A` |
 | POST | `/api/copies/{id}/finalize` | 入参 `{expected_revision}`（正整数，布尔 **422**），版本一致且无持有者时结稿为 `finalized`（`revision += 1`，其余不变），返回该次提交完整快照；版本过期 / 仍有持有者 / 已结稿 **409**，未知副本 **404**；结稿后领取 / 释放 / 修改均 **409**，不提供重开 |
 | GET | `/api/copies/{id}/revisions` | 按 `revision` 升序列出已记录版本的操作信息 `{id, revisions:[{revision,op,reviewer}]}`（`op` 为 `create` / `claim` / `release` / `modify` / `finalize` / `baseline`，创建 / 结稿 / 基线的 `reviewer` 为 `null`）；未知副本 **404** |
 | GET | `/api/copies/{id}/revisions/{revision}` | 读取该版本的完整快照 `{id,text,revision,status,op,reviewer,annotations,groups}`（只读，不改变当前状态；`annotations` 按该版保存的原序即创建顺序返回，当前副本响应仍按 `(start,end,label,id)` 排序）；未知副本或未记录版本 **404** |
@@ -881,9 +887,9 @@ JSON」得到：
 | POST | `/api/redact/export` | 入参 `{text, annotations:[{id,start,end,label}], redact_labels:[…]}`；命中标签的区间重叠或相接即合并，每区替换为一个 `[遮盖]`，命中批注不导出，其余批注跨区拆成可见片段（完全被遮盖的舍弃），返回 `{text, annotations:[{source_id,fragment,start,end,label}], count, redacted_count}`——片段按原批注顺序及原文位置排列，`fragment` 从 1 开始，范围内文字为原文可见部分；无命中时文本与批注范围不变；非法区间 / 空 label / 重复 id / 非法遮盖标签均返回 **422**（不返回部分结果） |
 | POST | `/api/copies` | 可领取审阅工作副本：入参 `{text, annotations:[{id,start,end,label}]}`（唯一字符串 id、非空 label、码点 `[start,end)`），返回 **201** 与初始快照（无人持有、`status=open`、`revision=1`，持久化到 SQLite 挂卷）；非法输入 **422** |
 | GET | `/api/copies/{id}` | 返回同一提交状态 `{id, text, revision, status, annotations:[{id,start,end,label,holder}], groups:[{annotation_ids,holder}]}`（正长度重叠传递连通、相接不连边）；未知副本 **404** |
-| POST | `/api/copies/{id}/annotations/{ann_id}/claim` | 入参 `{reviewer}`（非空字符串），按批注 id 整组领取（本人重复领取幂等）；他人持有 / 【409】，非法 reviewer **422**，副本 / 批注不存在 **404**，已结稿 **409**。`ann_id` 为任意唯一字符串（**含空串、含 `/` 与含换行 `\n` 的 id**），路径段按标准百分号编码：`审阅/1` → `%E5%AE%A1%E9%98%85%2F1`、字面 `%2F` → `%252F`、`a\n` → `a%0A`、空串 → 相邻两个斜杠 |
-| POST | `/api/copies/{id}/annotations/{ann_id}/release` | 入参 `{reviewer}`，持有者本人整组释放；无人持有 / 他人持有 / 已结稿 **409**，非法 reviewer **422**；`ann_id` 编码规则同 claim |
-| PATCH | `/api/copies/{id}/annotations/{ann_id}` | 入参 `{reviewer,start,end,label}`，仅持有者改单条范围与 label（不增删批注）后重算分组：并入的未领取批注归本人，触及他人 **409**（范围与持有权均不变），拆开的组保留原持有者；未持有 / 已结稿 **409**，非法区间 / 空 label / 非法 reviewer **422**；并发请求等价逐次完整执行。空串 id 的 URL 以斜杠结尾（`.../annotations/`），服务端只解码一次且完整保留解码后的每个字符，故 `/`（`%2F`）与字面 `%2F`（`%252F`）、`a` 与 `a\n`（`a%0A`）均不混同 |
+| POST | `/api/copies/{id}/annotations/{ann_id}/claim` | 入参 `{reviewer}`（非空字符串），按批注 id 整组领取，返回**本次提交的完整快照**（`revision` / `status` / `annotations` / `groups` 不混入后续请求的结果；本人重复领取幂等，返回判定时的快照，不增版本或历史）；他人持有 / 【409】，非法 reviewer **422**，副本 / 批注不存在 **404**，已结稿 **409**。`ann_id` 为任意唯一字符串（**含空串、含 `/` 与含换行 `\n` 的 id**），路径段按标准百分号编码：`审阅/1` → `%E5%AE%A1%E9%98%85%2F1`、字面 `%2F` → `%252F`、`a\n` → `a%0A`、空串 → 相邻两个斜杠 |
+| POST | `/api/copies/{id}/annotations/{ann_id}/release` | 入参 `{reviewer}`，持有者本人整组释放，返回**本次提交的完整快照**；无人持有 / 他人持有 / 已结稿 **409**，非法 reviewer **422**；`ann_id` 编码规则同 claim |
+| PATCH | `/api/copies/{id}/annotations/{ann_id}` | 入参 `{reviewer,start,end,label}`，仅持有者改单条范围与 label（不增删批注）后重算分组，返回**本次提交的完整快照**：并入的未领取批注归本人，触及他人 **409**（范围与持有权均不变），拆开的组保留原持有者；未持有 / 已结稿 **409**，非法区间 / 空 label / 非法 reviewer **422**；并发请求等价逐次完整执行。空串 id 的 URL 以斜杠结尾（`.../annotations/`），服务端只解码一次且完整保留解码后的每个字符，故 `/`（`%2F`）与字面 `%2F`（`%252F`）、`a` 与 `a\n`（`a%0A`）均不混同 |
 | POST | `/api/copies/{id}/finalize` | 入参 `{expected_revision}`（正整数，布尔 / 非正数 **422**），把副本结稿为不可再改的定稿：仅 `status` 由 `open` 变 `finalized`、`revision += 1`，返回该次提交完整快照（文本、批注、持有权与排序不变）；版本过期 / 仍有持有者 / 已结稿 **409**（失败不改任何状态），未知副本 **404**；结稿后有效的领取 / 释放 / 修改均 **409**，不提供重开；结稿与其他变更并发等价于某个先后次序 |
 | GET | `/api/copies/{id}/revisions` | 历史回看：按 `revision` 升序列出已记录版本 `{id, revisions:[{revision,op,reviewer}]}`（`op` 为 `create` / `claim` / `release` / `modify` / `finalize` / `baseline`；创建 / 结稿 / 基线的 `reviewer` 为 `null`）；幂等领取与失败请求不产生记录；未知副本 **404** |
 | GET | `/api/copies/{id}/revisions/{revision}` | 读取该版本完整快照 `{id,text,revision,status,op,reviewer,annotations:[{id,start,end,label,holder}],groups}`（只读，不改变当前状态；快照与副本变更同事务提交，不混入后续版本；`annotations` 按该版保存的原序即创建顺序返回，已存历史与 baseline 同样适用、不回写历史数据）；未知副本或未记录版本 **404** |

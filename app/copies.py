@@ -28,8 +28,12 @@ label），初始**无人持有**。
 
 `CopyState` 为不依赖数据库的纯内存核心（便于单测）；`CopyStore` 用 SQLite
 持久化，每个变更操作在进程级锁内「完整读入 → 纯核心运算 → 整体写回」，
-因此并发请求等价于逐次完整执行，不会丢失其他批注的修改。旧库启动时自动
-补 `status` 列，旧副本默认 `open` 且原 `revision` 不变。
+因此并发请求等价于逐次完整执行，不会丢失其他批注的修改。**变更响应的版本
+语义**：领取 / 释放 / 修改 / 结稿的成功响应是**本次提交**的完整快照——
+在锁内由刚提交的内存状态直接生成，`revision`、`status`、`annotations`、
+`groups` 不会混入提交完成后才到达的后续请求的结果；本人重复领取（幂等）
+返回**判定时**（锁内读入）的快照，不增加版本或历史。旧库启动时自动补
+`status` 列，旧副本默认 `open` 且原 `revision` 不变。
 
 **版本历史（回看）**：创建时记录 `revision=1` 的完整快照；此后每次使
 `revision` 递增的变更（领取 / 释放 / 修改 / 结稿）都把新版本的完整快照
@@ -631,6 +635,11 @@ class CopyStore:
         成功变更把新版本的完整历史快照（含操作类型 op 与 reviewer）与副本
         变更在同一事务提交——任一步写入失败二者均不变；幂等领取（运算返回
         False）与失败请求都不产生版本记录。
+
+        响应快照在**锁内**由刚提交（幂等领取时为判定时读入）的内存状态
+        直接生成并返回：提交后不在锁外重新读取，否则另一请求可能先提交
+        后续版本（如领取提交 rev2 后同一审阅者又释放提交 rev3），使本次
+        响应混入后续版本的 revision / status / annotations / groups。
         """
         with self._lock:
             conn = self._connect()
@@ -660,7 +669,9 @@ class CopyStore:
                 raise
             finally:
                 conn.close()
-        return self.get(copy_id)
+            # 锁内生成响应快照：state 即本次提交（幂等领取时为判定时）的
+            # 完整状态，与刚写入库的内容一致；后续请求的提交不影响本响应。
+            return state.snapshot()
 
     def claim(self, copy_id: str, ann_id: str, reviewer: str) -> dict:
         return self._apply(copy_id, lambda st: st.claim(ann_id, reviewer),
